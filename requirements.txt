@@ -2,5 +2,4 @@ Flask
 flask-cors
 flask-limiter
 psycopg2-binary
-python-dotenv
 gunicorn

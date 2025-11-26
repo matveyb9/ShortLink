@@ -1,4 +1,4 @@
-# Environment variables
+# Environment
 .env
 
 # Python
@@ -11,27 +11,14 @@ venv/
 env/
 
 # Logs
-logs/
 *.log
-
-# Database
-*.db
-*.sqlite3
-
-# SSL certificates
-nginx/ssl/*.pem
-nginx/ssl/*.key
-
-# Backups
-backups/
-
-# Docker
-*.pid
-.dockerignore
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
-*~
+
+# OS
+.DS_Store
+Thumbs.db
