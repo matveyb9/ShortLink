@@ -1,371 +1,652 @@
-from flask import Flask, request, jsonify, render_template, redirect
+from flask import Flask, request, jsonify, render_template_string, redirect
 from flask_cors import CORS
-from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
 import psycopg2
-from psycopg2.extras import RealDictCursor
-from psycopg2 import pool
+import pymysql
 import os
-import random
 import string
+import random
 from datetime import datetime
-import logging
-import re
-import time
+from urllib.parse import urlparse
 
-# Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s %(levelname)s: %(message)s',
-    handlers=[logging.StreamHandler()]
-)
-
-logger = logging.getLogger(__name__)
-
-app = Flask(__name__, static_folder='static', template_folder='templates')
+app = Flask(__name__)
 CORS(app)
 
-# Конфигурация из переменных окружения
-DATABASE_URL = os.getenv('DATABASE_URL')  # Для Cloud Apps (формат postgresql://...)
+# Конфигурация из переменных среды
+DB_TYPE = os.getenv('DB_TYPE', 'postgresql')  # postgresql или mysql
 DB_HOST = os.getenv('DB_HOST', 'localhost')
-DB_PORT = os.getenv('DB_PORT', '5432')
+DB_PORT = os.getenv('DB_PORT', '5432' if DB_TYPE == 'postgresql' else '3306')
 DB_NAME = os.getenv('DB_NAME', 'urlshortener')
 DB_USER = os.getenv('DB_USER', 'postgres')
 DB_PASSWORD = os.getenv('DB_PASSWORD', '')
-DOMAIN = os.getenv('DOMAIN', 'localhost')
-PORT = int(os.getenv('PORT', 5000))  # Cloud Apps часто передает PORT
+BASE_URL = os.getenv('BASE_URL', 'http://localhost:5000')
 
-# Rate limiting (используем memory для упрощения)
-limiter = Limiter(
-    app=app,
-    key_func=get_remote_address,
-    default_limits=["200 per day", "50 per hour"],
-    storage_uri="memory://"
-)
-
-# Connection pool
-connection_pool = None
-
-def parse_database_url(url):
-    """Парсинг DATABASE_URL для Cloud Apps"""
-    # Формат: postgresql://user:password@host:port/dbname
-    if not url:
-        return None
-    
-    import re
-    pattern = r'postgresql://([^:]+):([^@]+)@([^:]+):(\d+)/(.+)'
-    match = re.match(pattern, url)
-    
-    if match:
-        return {
-            'user': match.group(1),
-            'password': match.group(2),
-            'host': match.group(3),
-            'port': match.group(4),
-            'database': match.group(5)
-        }
-    return None
-
-def get_db_config():
-    """Получение конфигурации БД"""
-    if DATABASE_URL:
-        parsed = parse_database_url(DATABASE_URL)
-        if parsed:
-            return parsed
-    
-    return {
-        'host': DB_HOST,
-        'port': DB_PORT,
-        'database': DB_NAME,
-        'user': DB_USER,
-        'password': DB_PASSWORD
-    }
-
-def wait_for_db(max_retries=30, delay=2):
-    """Ожидание готовности БД"""
-    config = get_db_config()
-    
-    for i in range(max_retries):
-        try:
-            conn = psycopg2.connect(**config)
-            conn.close()
-            logger.info("Database is ready!")
-            return True
-        except psycopg2.OperationalError as e:
-            if i < max_retries - 1:
-                logger.info(f"Waiting for database... ({i+1}/{max_retries})")
-                time.sleep(delay)
-            else:
-                logger.error(f"Could not connect to database after {max_retries} attempts")
-                raise
-    return False
-
-def init_connection_pool():
-    """Инициализация пула соединений"""
-    global connection_pool
-    
-    config = get_db_config()
-    
-    try:
-        connection_pool = psycopg2.pool.ThreadedConnectionPool(
-            minconn=1,
-            maxconn=10,
-            **config
-        )
-        logger.info("Connection pool created successfully")
-    except Exception as e:
-        logger.error(f"Error creating connection pool: {e}")
-        raise
-
+# Подключение к базе данных
 def get_db_connection():
-    """Получение соединения из пула"""
-    try:
-        return connection_pool.getconn()
-    except Exception as e:
-        logger.error(f"Error getting connection from pool: {e}")
-        raise
+    if DB_TYPE == 'postgresql':
+        return psycopg2.connect(
+            host=DB_HOST,
+            port=DB_PORT,
+            database=DB_NAME,
+            user=DB_USER,
+            password=DB_PASSWORD
+        )
+    else:  # mysql
+        return pymysql.connect(
+            host=DB_HOST,
+            port=int(DB_PORT),
+            database=DB_NAME,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            cursorclass=pymysql.cursors.DictCursor
+        )
 
-def return_db_connection(conn):
-    """Возврат соединения в пул"""
-    try:
-        connection_pool.putconn(conn)
-    except Exception as e:
-        logger.error(f"Error returning connection to pool: {e}")
-
+# Инициализация базы данных
 def init_db():
-    """Инициализация базы данных"""
     conn = get_db_connection()
-    try:
-        cur = conn.cursor()
-        
-        cur.execute('''
+    cursor = conn.cursor()
+    
+    if DB_TYPE == 'postgresql':
+        cursor.execute('''
             CREATE TABLE IF NOT EXISTS urls (
                 id SERIAL PRIMARY KEY,
+                shortcode VARCHAR(6) UNIQUE NOT NULL,
                 original_url TEXT NOT NULL,
-                short_code VARCHAR(6) UNIQUE NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                clicks INTEGER DEFAULT 0,
-                last_clicked TIMESTAMP
+                clicks INTEGER DEFAULT 0
             )
         ''')
-        
-        cur.execute('CREATE INDEX IF NOT EXISTS idx_short_code ON urls(short_code)')
-        cur.execute('CREATE INDEX IF NOT EXISTS idx_created_at ON urls(created_at)')
-        
-        conn.commit()
-        cur.close()
-        logger.info("Database initialized successfully")
-    except Exception as e:
-        logger.error(f"Error initializing database: {e}")
-        raise
-    finally:
-        return_db_connection(conn)
+    else:  # mysql
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS urls (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                shortcode VARCHAR(6) UNIQUE NOT NULL,
+                original_url TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                clicks INT DEFAULT 0
+            )
+        ''')
+    
+    conn.commit()
+    cursor.close()
+    conn.close()
 
-def is_valid_url(url):
-    """Валидация URL"""
-    regex = re.compile(
-        r'^https?://'
-        r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+[A-Z]{2,6}\.?|'
-        r'localhost|'
-        r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'
-        r'(?::\d+)?'
-        r'(?:/?|[/?]\S+)$', re.IGNORECASE)
-    return url is not None and regex.search(url) is not None
-
-def generate_short_code():
-    """Генерация уникального 6-значного кода"""
+# Генерация уникального короткого кода
+def generate_shortcode():
     characters = string.ascii_letters + string.digits
-    max_attempts = 10
-    
-    for _ in range(max_attempts):
-        code = ''.join(random.choices(characters, k=6))
-        
+    while True:
+        shortcode = ''.join(random.choices(characters, k=6))
         conn = get_db_connection()
-        try:
-            cur = conn.cursor()
-            cur.execute('SELECT short_code FROM urls WHERE short_code = %s', (code,))
-            exists = cur.fetchone()
-            cur.close()
-            
-            if not exists:
-                return code
-        finally:
-            return_db_connection(conn)
+        cursor = conn.cursor()
+        
+        if DB_TYPE == 'postgresql':
+            cursor.execute('SELECT shortcode FROM urls WHERE shortcode = %s', (shortcode,))
+        else:
+            cursor.execute('SELECT shortcode FROM urls WHERE shortcode = %s', (shortcode,))
+        
+        exists = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        
+        if not exists:
+            return shortcode
+
+# Валидация URL
+def is_valid_url(url):
+    try:
+        result = urlparse(url)
+        return all([result.scheme, result.netloc])
+    except:
+        return False
+
+# HTML шаблон главной страницы
+HOME_PAGE = '''
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>URL Shortener</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+        
+        .container {
+            background: white;
+            border-radius: 20px;
+            padding: 40px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            max-width: 600px;
+            width: 100%;
+        }
+        
+        h1 {
+            color: #333;
+            margin-bottom: 10px;
+            font-size: 32px;
+        }
+        
+        .subtitle {
+            color: #666;
+            margin-bottom: 30px;
+            font-size: 16px;
+        }
+        
+        .input-group {
+            margin-bottom: 20px;
+        }
+        
+        input[type="url"] {
+            width: 100%;
+            padding: 15px;
+            border: 2px solid #e0e0e0;
+            border-radius: 10px;
+            font-size: 16px;
+            transition: border-color 0.3s;
+        }
+        
+        input[type="url"]:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        
+        button {
+            width: 100%;
+            padding: 15px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 10px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 20px rgba(102, 126, 234, 0.4);
+        }
+        
+        button:active {
+            transform: translateY(0);
+        }
+        
+        button:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+        
+        .result {
+            margin-top: 30px;
+            padding: 20px;
+            background: #f5f5f5;
+            border-radius: 10px;
+            display: none;
+        }
+        
+        .result.show {
+            display: block;
+            animation: slideIn 0.3s ease-out;
+        }
+        
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateY(-10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+        
+        .short-url {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-top: 10px;
+        }
+        
+        .short-url input {
+            flex: 1;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            font-size: 14px;
+        }
+        
+        .copy-btn {
+            padding: 10px 20px;
+            width: auto;
+            background: #667eea;
+            font-size: 14px;
+        }
+        
+        .error {
+            color: #e74c3c;
+            margin-top: 10px;
+            font-size: 14px;
+            display: none;
+        }
+        
+        .error.show {
+            display: block;
+        }
+        
+        .success {
+            color: #27ae60;
+            margin-top: 10px;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔗 URL Shortener</h1>
+        <p class="subtitle">Сократите длинную ссылку в один клик</p>
+        
+        <form id="shortenForm">
+            <div class="input-group">
+                <input 
+                    type="url" 
+                    id="urlInput" 
+                    placeholder="Вставьте вашу длинную ссылку здесь..." 
+                    required
+                >
+            </div>
+            <button type="submit" id="submitBtn">Сократить ссылку</button>
+            <div class="error" id="error"></div>
+        </form>
+        
+        <div class="result" id="result">
+            <h3>✅ Ссылка успешно сокращена!</h3>
+            <div class="short-url">
+                <input type="text" id="shortUrl" readonly>
+                <button class="copy-btn" onclick="copyToClipboard()">Копировать</button>
+            </div>
+            <p class="success" id="copySuccess" style="display:none;">Скопировано!</p>
+        </div>
+    </div>
     
-    raise Exception("Unable to generate unique short code")
+    <script>
+        const form = document.getElementById('shortenForm');
+        const urlInput = document.getElementById('urlInput');
+        const submitBtn = document.getElementById('submitBtn');
+        const result = document.getElementById('result');
+        const shortUrlInput = document.getElementById('shortUrl');
+        const error = document.getElementById('error');
+        const copySuccess = document.getElementById('copySuccess');
+        
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const url = urlInput.value.trim();
+            
+            if (!url) {
+                showError('Пожалуйста, введите URL');
+                return;
+            }
+            
+            error.classList.remove('show');
+            submitBtn.disabled = true;
+            submitBtn.textContent = 'Сокращаем...';
+            
+            try {
+                const response = await fetch('/api/shorten', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ url: url })
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok) {
+                    shortUrlInput.value = data.short_url;
+                    result.classList.add('show');
+                    copySuccess.style.display = 'none';
+                } else {
+                    showError(data.error || 'Произошла ошибка');
+                }
+            } catch (err) {
+                showError('Ошибка соединения с сервером');
+            } finally {
+                submitBtn.disabled = false;
+                submitBtn.textContent = 'Сократить ссылку';
+            }
+        });
+        
+        function showError(message) {
+            error.textContent = message;
+            error.classList.add('show');
+            result.classList.remove('show');
+        }
+        
+        function copyToClipboard() {
+            shortUrlInput.select();
+            document.execCommand('copy');
+            copySuccess.style.display = 'block';
+            setTimeout(() => {
+                copySuccess.style.display = 'none';
+            }, 2000);
+        }
+    </script>
+</body>
+</html>
+'''
 
+# HTML шаблон страницы редиректа
+REDIRECT_PAGE = '''
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Переадресация...</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+        
+        .container {
+            background: white;
+            border-radius: 20px;
+            padding: 40px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            max-width: 600px;
+            width: 100%;
+            text-align: center;
+        }
+        
+        h1 {
+            color: #333;
+            margin-bottom: 20px;
+            font-size: 28px;
+        }
+        
+        .url-box {
+            background: #f5f5f5;
+            padding: 20px;
+            border-radius: 10px;
+            margin: 20px 0;
+            word-break: break-all;
+        }
+        
+        .url {
+            color: #667eea;
+            font-weight: 600;
+        }
+        
+        .redirect-info {
+            color: #666;
+            margin-top: 20px;
+            font-size: 14px;
+        }
+        
+        .button {
+            display: inline-block;
+            margin-top: 20px;
+            padding: 12px 30px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            text-decoration: none;
+            border-radius: 10px;
+            font-weight: 600;
+            transition: transform 0.2s;
+        }
+        
+        .button:hover {
+            transform: translateY(-2px);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔗 Переадресация</h1>
+        <p>Эта короткая ссылка ведёт на:</p>
+        <div class="url-box">
+            <div class="url">{{ original_url }}</div>
+        </div>
+        <a href="{{ original_url }}" class="button">Перейти по ссылке</a>
+        <p class="redirect-info">Вы будете перенаправлены автоматически через 3 секунды...</p>
+    </div>
+    
+    <script>
+        setTimeout(() => {
+            window.location.href = '{{ original_url }}';
+        }, 3000);
+    </script>
+</body>
+</html>
+'''
+
+# HTML шаблон страницы 404
+ERROR_404_PAGE = '''
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>404 - Ссылка не найдена</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+        
+        .container {
+            background: white;
+            border-radius: 20px;
+            padding: 40px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            max-width: 600px;
+            width: 100%;
+            text-align: center;
+        }
+        
+        .error-code {
+            font-size: 80px;
+            font-weight: 700;
+            color: #667eea;
+            margin-bottom: 20px;
+        }
+        
+        h1 {
+            color: #333;
+            margin-bottom: 15px;
+            font-size: 28px;
+        }
+        
+        p {
+            color: #666;
+            margin-bottom: 30px;
+            font-size: 16px;
+        }
+        
+        .button {
+            display: inline-block;
+            padding: 12px 30px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            text-decoration: none;
+            border-radius: 10px;
+            font-weight: 600;
+            transition: transform 0.2s;
+        }
+        
+        .button:hover {
+            transform: translateY(-2px);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="error-code">404</div>
+        <h1>Ссылка не найдена</h1>
+        <p>К сожалению, такой короткой ссылки не существует.<br>Проверьте правильность адреса.</p>
+        <a href="/" class="button">На главную</a>
+    </div>
+</body>
+</html>
+'''
+
+# Маршруты
 @app.route('/')
-def index():
-    """Главная страница"""
-    return render_template('index.html', domain=DOMAIN)
+def home():
+    return render_template_string(HOME_PAGE)
 
-@app.route('/<short_code>')
-@limiter.limit("30 per minute")
-def redirect_to_url(short_code):
-    """Редирект по короткой ссылке"""
-    if not re.match(r'^[a-zA-Z0-9]{6}$', short_code):
-        logger.warning(f"Invalid short code format: {short_code}")
-        return render_template('404.html'), 404
+@app.route('/<shortcode>')
+def redirect_url(shortcode):
+    # Проверка формата shortcode
+    if len(shortcode) != 6 or not all(c in string.ascii_letters + string.digits for c in shortcode):
+        return render_template_string(ERROR_404_PAGE), 404
     
     conn = get_db_connection()
-    try:
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        
-        cur.execute('SELECT original_url FROM urls WHERE short_code = %s', (short_code,))
-        result = cur.fetchone()
-        
-        if result:
-            cur.execute(
-                'UPDATE urls SET clicks = clicks + 1, last_clicked = CURRENT_TIMESTAMP WHERE short_code = %s',
-                (short_code,)
-            )
-            conn.commit()
-            
-            original_url = result['original_url']
-            cur.close()
-            
-            logger.info(f"Redirect: {short_code} -> {original_url}")
-            return render_template('redirect.html', url=original_url, domain=DOMAIN)
-        else:
-            logger.warning(f"Short code not found: {short_code}")
-            cur.close()
-            return render_template('404.html'), 404
-    except Exception as e:
-        logger.error(f"Error in redirect: {e}")
-        return render_template('404.html'), 404
-    finally:
-        return_db_connection(conn)
+    cursor = conn.cursor()
+    
+    if DB_TYPE == 'postgresql':
+        cursor.execute('SELECT original_url FROM urls WHERE shortcode = %s', (shortcode,))
+        cursor.execute('UPDATE urls SET clicks = clicks + 1 WHERE shortcode = %s', (shortcode,))
+    else:
+        cursor.execute('SELECT original_url FROM urls WHERE shortcode = %s', (shortcode,))
+        cursor.execute('UPDATE urls SET clicks = clicks + 1 WHERE shortcode = %s', (shortcode,))
+    
+    result = cursor.fetchone()
+    conn.commit()
+    cursor.close()
+    conn.close()
+    
+    if result:
+        original_url = result[0] if DB_TYPE == 'postgresql' else result['original_url']
+        return render_template_string(REDIRECT_PAGE, original_url=original_url)
+    else:
+        return render_template_string(ERROR_404_PAGE), 404
 
 @app.route('/api/shorten', methods=['POST'])
-@limiter.limit("10 per minute")
 def shorten_url():
-    """API для сокращения ссылки"""
-    try:
-        data = request.get_json()
-        
-        if not data or 'url' not in data:
-            return jsonify({'error': 'URL is required'}), 400
-        
-        original_url = data['url'].strip()
-        
-        if not is_valid_url(original_url):
-            return jsonify({'error': 'Invalid URL format'}), 400
-        
-        if len(original_url) > 2048:
-            return jsonify({'error': 'URL too long'}), 400
-        
-        conn = get_db_connection()
-        try:
-            cur = conn.cursor(cursor_factory=RealDictCursor)
-            
-            cur.execute('SELECT short_code FROM urls WHERE original_url = %s', (original_url,))
-            existing = cur.fetchone()
-            
-            if existing:
-                short_code = existing['short_code']
-                logger.info(f"URL already exists: {original_url} -> {short_code}")
-            else:
-                short_code = generate_short_code()
-                
-                cur.execute(
-                    'INSERT INTO urls (original_url, short_code) VALUES (%s, %s)',
-                    (original_url, short_code)
-                )
-                conn.commit()
-                logger.info(f"Created new short URL: {original_url} -> {short_code}")
-            
-            cur.close()
-            
-            # Определяем протокол
-            protocol = 'https' if request.is_secure or request.headers.get('X-Forwarded-Proto') == 'https' else 'http'
-            short_url = f"{protocol}://{DOMAIN}/{short_code}"
-            
-            return jsonify({
-                'original_url': original_url,
-                'short_url': short_url,
-                'short_code': short_code
-            }), 201
-        finally:
-            return_db_connection(conn)
-            
-    except Exception as e:
-        logger.error(f"Error in shorten_url: {e}")
-        return jsonify({'error': 'Internal server error'}), 500
-
-@app.route('/api/info/<short_code>', methods=['GET'])
-@limiter.limit("30 per minute")
-def get_url_info(short_code):
-    """API для получения информации о ссылке"""
-    if not re.match(r'^[a-zA-Z0-9]{6}$', short_code):
-        return jsonify({'error': 'Invalid short code format'}), 400
+    data = request.get_json()
+    
+    if not data or 'url' not in data:
+        return jsonify({'error': 'URL не предоставлен'}), 400
+    
+    original_url = data['url'].strip()
+    
+    if not is_valid_url(original_url):
+        return jsonify({'error': 'Некорректный URL'}), 400
+    
+    shortcode = generate_shortcode()
     
     conn = get_db_connection()
+    cursor = conn.cursor()
+    
     try:
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        
-        cur.execute('SELECT * FROM urls WHERE short_code = %s', (short_code,))
-        result = cur.fetchone()
-        
-        cur.close()
-        
-        if result:
-            return jsonify({
-                'original_url': result['original_url'],
-                'short_code': result['short_code'],
-                'created_at': result['created_at'].isoformat(),
-                'clicks': result['clicks'],
-                'last_clicked': result['last_clicked'].isoformat() if result['last_clicked'] else None
-            }), 200
+        if DB_TYPE == 'postgresql':
+            cursor.execute(
+                'INSERT INTO urls (shortcode, original_url) VALUES (%s, %s)',
+                (shortcode, original_url)
+            )
         else:
-            return jsonify({'error': 'URL not found'}), 404
+            cursor.execute(
+                'INSERT INTO urls (shortcode, original_url) VALUES (%s, %s)',
+                (shortcode, original_url)
+            )
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        short_url = f"{BASE_URL}/{shortcode}"
+        
+        return jsonify({
+            'short_url': short_url,
+            'shortcode': shortcode,
+            'original_url': original_url
+        }), 201
+        
     except Exception as e:
-        logger.error(f"Error in get_url_info: {e}")
-        return jsonify({'error': 'Internal server error'}), 500
-    finally:
-        return_db_connection(conn)
+        conn.rollback()
+        cursor.close()
+        conn.close()
+        return jsonify({'error': 'Ошибка при создании короткой ссылки'}), 500
 
-@app.route('/health')
-def health_check():
-    """Health check endpoint"""
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute('SELECT 1')
-        cur.close()
-        return_db_connection(conn)
-        return jsonify({'status': 'healthy', 'database': 'connected'}), 200
-    except Exception as e:
-        logger.error(f"Health check failed: {e}")
-        return jsonify({'status': 'unhealthy', 'error': str(e)}), 503
-
-@app.errorhandler(429)
-def ratelimit_handler(e):
-    """Обработчик rate limit"""
-    return jsonify({'error': 'Rate limit exceeded. Please try again later.'}), 429
-
-@app.errorhandler(500)
-def internal_error(error):
-    """Обработчик внутренних ошибок"""
-    logger.error(f"Internal error: {error}")
-    return jsonify({'error': 'Internal server error'}), 500
-
-# Инициализация при запуске
-try:
-    logger.info("Starting application...")
-    logger.info(f"Port: {PORT}")
-    logger.info(f"Domain: {DOMAIN}")
+@app.route('/api/info/<shortcode>', methods=['GET'])
+def get_url_info(shortcode):
+    if len(shortcode) != 6:
+        return jsonify({'error': 'Некорректный shortcode'}), 400
     
-    # Ожидание БД
-    wait_for_db()
+    conn = get_db_connection()
+    cursor = conn.cursor()
     
-    # Инициализация пула и БД
-    init_connection_pool()
-    init_db()
+    if DB_TYPE == 'postgresql':
+        cursor.execute(
+            'SELECT original_url, created_at, clicks FROM urls WHERE shortcode = %s',
+            (shortcode,)
+        )
+    else:
+        cursor.execute(
+            'SELECT original_url, created_at, clicks FROM urls WHERE shortcode = %s',
+            (shortcode,)
+        )
     
-    logger.info("Application started successfully!")
-except Exception as e:
-    logger.error(f"Failed to start application: {e}")
-    raise
+    result = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    
+    if result:
+        if DB_TYPE == 'postgresql':
+            return jsonify({
+                'shortcode': shortcode,
+                'original_url': result[0],
+                'created_at': result[1].isoformat(),
+                'clicks': result[2]
+            })
+        else:
+            return jsonify({
+                'shortcode': shortcode,
+                'original_url': result['original_url'],
+                'created_at': result['created_at'].isoformat(),
+                'clicks': result['clicks']
+            })
+    else:
+        return jsonify({'error': 'Ссылка не найдена'}), 404
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=PORT, debug=False)
+    init_db()
+    app.run(host='0.0.0.0', port=5000, debug=False)

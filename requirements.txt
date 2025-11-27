@@ -1,5 +1,5 @@
 Flask
-flask-cors
-flask-limiter
+Flask-CORS
 psycopg2-binary
+PyMySQL
 gunicorn
